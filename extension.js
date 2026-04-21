@@ -33,58 +33,61 @@ export default class FunNotch extends Extension {
             let file = Gio.File.new_for_path(LOG_FILE);
             let timestamp = new Date().toISOString();
             let line = `[${timestamp}] ${message}\n`;
-
-            // APPEND_ONLY so we don't overwrite previous logs
-            let stream = file.append_to(
-                Gio.FileCreateFlags.NONE,
-                null
-            );
+            let stream = file.append_to(Gio.FileCreateFlags.NONE, null);
             stream.write(line, null);
             stream.close(null);
-        } catch (e) {
-            // silently fail if we can't write logs
-        }
+        } catch (e) { }
     }
 
     enable() {
         this._log('enable() called');
 
-        // Outer container — horizontal rectangle, centered on screen
+        // Outer container
         this._widget = new St.BoxLayout({
             style: `
                 background-color: black;
                 border-radius: 12px;
-                padding: 8px 16px;
+                padding: 0 12px;
                 width: 400px;
                 height: 48px;
             `,
             reactive: true,
         });
 
-        // Left side — reserved for future image/icon
-        // Empty for now but takes up space to push text right
+        // Left half — reserved for future image, takes up equal space
         this._leftSlot = new St.Bin({
-            style: 'width: 40px;',
+            x_expand: true,
+            y_expand: true,
+            x_align: Clutter.ActorAlign.START,
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'min-width: 0;',
         });
 
-        // Right side — text container
+        // Vertical divider feel — just a small gap in the center
+        this._separator = new St.Widget({
+            style: 'width: 8px;',
+        });
+
+        // Right half — text stacked vertically, anchored to right
         this._textBox = new St.BoxLayout({
             vertical: true,
             x_expand: true,
-            x_align: Clutter.ActorAlign.END,  // align content to the right
+            y_expand: true,
+            x_align: Clutter.ActorAlign.END,
+            y_align: Clutter.ActorAlign.CENTER,
         });
 
-        // Song title
         this._titleLabel = new St.Label({
             text: 'Nothing Playing',
             style: 'color: white; font-size: 13px;',
+            y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.END,
         });
 
-        // Artist name — slightly smaller and dimmer
         this._artistLabel = new St.Label({
             text: '',
             style: 'color: #aaaaaa; font-size: 11px;',
+            y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.END,
         });
 
@@ -92,9 +95,10 @@ export default class FunNotch extends Extension {
         this._textBox.add_child(this._artistLabel);
 
         this._widget.add_child(this._leftSlot);
+        this._widget.add_child(this._separator);
         this._widget.add_child(this._textBox);
 
-        // Center on screen using constraints
+        // Center on screen
         this._widget.add_constraint(new Clutter.AlignConstraint({
             source: Main.layoutManager.uiGroup,
             align_axis: Clutter.AlignAxis.X_AXIS,
@@ -108,7 +112,6 @@ export default class FunNotch extends Extension {
         }));
 
         Main.layoutManager.addTopChrome(this._widget);
-
         this._startWatching();
     }
 
@@ -145,9 +148,7 @@ export default class FunNotch extends Extension {
                     let reply = connection.call_finish(result);
                     let names = reply.deepUnpack()[0];
                     let players = names.filter(n => n.startsWith(MPRIS_BUS_PREFIX));
-
                     this._log(`Found players: ${players.join(', ') || 'none'}`);
-
                     players.forEach(name => this._watchPlayer(name));
                 } catch (e) {
                     this._log(`_findExistingPlayers error: ${e}`);
@@ -158,7 +159,6 @@ export default class FunNotch extends Extension {
 
     _onNameOwnerChanged(connection, sender, objectPath, interfaceName, signalName, parameters) {
         let [name, , newOwner] = parameters.deepUnpack();
-
         if (!name.startsWith(MPRIS_BUS_PREFIX)) return;
 
         if (newOwner !== '') {
@@ -166,9 +166,7 @@ export default class FunNotch extends Extension {
             this._watchPlayer(name);
         } else {
             this._log(`Player disappeared: ${name}`);
-            this._titleLabel.set_text('Nothing Playing');
-            this._artistLabel.set_text('');
-
+            this._clearDisplay();
             if (this._propertiesWatcherId) {
                 this._dbusConnection.signal_unsubscribe(this._propertiesWatcherId);
                 this._propertiesWatcherId = null;
@@ -177,7 +175,6 @@ export default class FunNotch extends Extension {
     }
 
     _watchPlayer(busName) {
-        // We only care about Firefox
         if (!busName.toLowerCase().includes('firefox')) {
             this._log(`Skipping non-firefox player: ${busName}`);
             return;
@@ -190,6 +187,8 @@ export default class FunNotch extends Extension {
             this._dbusConnection.signal_unsubscribe(this._propertiesWatcherId);
         }
 
+        // Listen to ALL property changes — this catches both
+        // Metadata changes (track changed) and PlaybackStatus changes (play/pause)
         this._propertiesWatcherId = this._dbusConnection.signal_subscribe(
             busName,
             'org.freedesktop.DBus.Properties',
@@ -201,6 +200,7 @@ export default class FunNotch extends Extension {
         );
 
         this._readCurrentTrack(busName);
+        this._readPlaybackStatus(busName);
     }
 
     _readCurrentTrack(busName) {
@@ -209,10 +209,7 @@ export default class FunNotch extends Extension {
             MPRIS_OBJECT_PATH,
             'org.freedesktop.DBus.Properties',
             'Get',
-            new GLib.Variant('(ss)', [
-                'org.mpris.MediaPlayer2.Player',
-                'Metadata'
-            ]),
+            new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'Metadata']),
             new GLib.VariantType('(v)'),
             Gio.DBusCallFlags.NONE,
             -1,
@@ -229,8 +226,48 @@ export default class FunNotch extends Extension {
         );
     }
 
+    _readPlaybackStatus(busName) {
+        this._dbusConnection.call(
+            busName,
+            MPRIS_OBJECT_PATH,
+            'org.freedesktop.DBus.Properties',
+            'Get',
+            new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', 'PlaybackStatus']),
+            new GLib.VariantType('(v)'),
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (connection, result) => {
+                try {
+                    let reply = connection.call_finish(result);
+                    let status = reply.deepUnpack()[0].unpack();
+                    this._log(`PlaybackStatus: ${status}`);
+                    this._handlePlaybackStatus(status);
+                } catch (e) {
+                    this._log(`_readPlaybackStatus error: ${e}`);
+                }
+            }
+        );
+    }
+
+    _handlePlaybackStatus(status) {
+        // status is one of: "Playing", "Paused", "Stopped"
+        if (status === 'Paused' || status === 'Stopped') {
+            this._clearDisplay();
+        }
+        // If Playing, the metadata will already be shown via _updateLabels
+        // so we don't need to do anything extra here
+    }
+
     _onPropertiesChanged(connection, sender, objectPath, interfaceName, signalName, parameters) {
         let [, changedProps] = parameters.deepUnpack();
+
+        if ('PlaybackStatus' in changedProps) {
+            let status = changedProps['PlaybackStatus'].unpack();
+            this._log(`PlaybackStatus changed: ${status}`);
+            this._handlePlaybackStatus(status);
+        }
+
         if ('Metadata' in changedProps) {
             this._updateLabels(changedProps['Metadata']);
         }
@@ -242,16 +279,12 @@ export default class FunNotch extends Extension {
                 ? metadata.recursiveUnpack()
                 : metadata;
 
-            this._log(`Raw metadata keys: ${Object.keys(unpacked).join(', ')}`);
-
-            // Check if the track URL is from Apple Music
             let trackUrl = unpacked['xesam:url'] ?? '';
             this._log(`Track URL: ${trackUrl}`);
 
             if (!trackUrl.includes('music.apple.com')) {
                 this._log('Not Apple Music, ignoring');
-                this._titleLabel.set_text('Nothing Playing');
-                this._artistLabel.set_text('');
+                this._clearDisplay();
                 return;
             }
 
@@ -267,6 +300,11 @@ export default class FunNotch extends Extension {
         } catch (e) {
             this._log(`_updateLabels error: ${e}`);
         }
+    }
+
+    _clearDisplay() {
+        this._titleLabel.set_text('Nothing Playing');
+        this._artistLabel.set_text('');
     }
 
     disable() {

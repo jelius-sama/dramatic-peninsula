@@ -26,6 +26,17 @@ const MPRIS_BUS_PREFIX = 'org.mpris.MediaPlayer2';
 const MPRIS_OBJECT_PATH = '/org/mpris/MediaPlayer2';
 const LOG_FILE = '/tmp/fun-notch.log';
 
+// Sizes
+const COLLAPSED_IDLE_WIDTH = 120;   // not playing, collapsed
+const COLLAPSED_PLAYING_WIDTH = 220; // playing, collapsed (wider so em dash is visible)
+const EXPANDED_WIDTH = 400;          // hovered, expanded
+const COLLAPSED_HEIGHT = 36;
+const EXPANDED_HEIGHT = 48;
+
+// Animation
+const ANIM_DURATION = 250; // ms
+const ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUAD;
+
 export default class FunNotch extends Extension {
 
     _log(message) {
@@ -42,19 +53,28 @@ export default class FunNotch extends Extension {
     enable() {
         this._log('enable() called');
 
-        // Outer container
+        // Track state
+        this._isPlaying = false;
+        this._isPaused = false;
+        this._isHovered = false;
+        this._lastTitle = '';
+        this._lastArtist = '';
+
+        // --- Build UI ---
+
         this._widget = new St.BoxLayout({
             style: `
                 background-color: black;
                 border-radius: 12px;
                 padding: 0 12px;
-                width: 400px;
-                height: 48px;
+                width: ${COLLAPSED_IDLE_WIDTH}px;
+                height: ${COLLAPSED_HEIGHT}px;
             `,
             reactive: true,
+            clip_to_allocation: true,
         });
 
-        // Left half — reserved for future image, takes up equal space
+        // Left slot — future image/waveform area
         this._leftSlot = new St.Bin({
             x_expand: true,
             y_expand: true,
@@ -63,32 +83,44 @@ export default class FunNotch extends Extension {
             style: 'min-width: 0;',
         });
 
-        // Vertical divider feel — just a small gap in the center
+        // Em dash shown when playing but collapsed
+        this._waveformLabel = new St.Label({
+            text: '—',
+            style: 'color: white; font-size: 16px;',
+            y_align: Clutter.ActorAlign.CENTER,
+            x_align: Clutter.ActorAlign.CENTER,
+            opacity: 0, // hidden by default
+        });
+        this._leftSlot.set_child(this._waveformLabel);
+
+        // Separator
         this._separator = new St.Widget({
             style: 'width: 8px;',
+            opacity: 0, // hidden when collapsed
         });
 
-        // Right half — text stacked vertically, anchored to right
+        // Right slot — text
         this._textBox = new St.BoxLayout({
             vertical: true,
             x_expand: true,
             y_expand: true,
             x_align: Clutter.ActorAlign.END,
             y_align: Clutter.ActorAlign.CENTER,
+            opacity: 0, // hidden when collapsed
         });
 
         this._titleLabel = new St.Label({
-            text: 'Nothing Playing',
+            text: '',
             style: 'color: white; font-size: 13px;',
-            y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.END,
+            y_align: Clutter.ActorAlign.CENTER,
         });
 
         this._artistLabel = new St.Label({
             text: '',
             style: 'color: #aaaaaa; font-size: 11px;',
-            y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.END,
+            y_align: Clutter.ActorAlign.CENTER,
         });
 
         this._textBox.add_child(this._titleLabel);
@@ -104,16 +136,89 @@ export default class FunNotch extends Extension {
             align_axis: Clutter.AlignAxis.X_AXIS,
             factor: 0.5,
         }));
-
         this._widget.add_constraint(new Clutter.AlignConstraint({
             source: Main.layoutManager.uiGroup,
             align_axis: Clutter.AlignAxis.Y_AXIS,
             factor: 0.5,
         }));
 
+        // Hover events
+        this._widget.connect('enter-event', () => {
+            this._isHovered = true;
+            this._expand();
+        });
+        this._widget.connect('leave-event', () => {
+            this._isHovered = false;
+            this._collapse();
+        });
+
         Main.layoutManager.addTopChrome(this._widget);
         this._startWatching();
     }
+
+    // --- Animation helpers ---
+
+    _animateProp(actor, prop, value) {
+        actor.set_easing_duration(ANIM_DURATION);
+        actor.set_easing_mode(ANIM_MODE);
+        actor[prop] = value;
+    }
+
+    _expand() {
+        this._log('Expanding');
+
+        // Expand the widget
+        this._animateProp(this._widget, 'width', EXPANDED_WIDTH);
+        this._animateProp(this._widget, 'height', EXPANDED_HEIGHT);
+
+        // Hide em dash, show text area
+        this._animateProp(this._waveformLabel, 'opacity', 0);
+        this._animateProp(this._separator, 'opacity', 255);
+        this._animateProp(this._textBox, 'opacity', 255);
+
+        // Update text content based on state
+        if (this._isPlaying) {
+            // Actively playing — full brightness
+            this._titleLabel.style = 'color: white; font-size: 13px;';
+            this._artistLabel.style = 'color: #aaaaaa; font-size: 11px;';
+            this._titleLabel.set_text(this._lastTitle || 'Unknown Title');
+            this._artistLabel.set_text(this._lastArtist || '');
+        } else if (this._isPaused) {
+            // Paused — dimmed to indicate paused state
+            this._titleLabel.style = 'color: #888888; font-size: 13px;';
+            this._artistLabel.style = 'color: #666666; font-size: 11px;';
+            this._titleLabel.set_text(this._lastTitle || 'Unknown Title');
+            this._artistLabel.set_text(this._lastArtist || '');
+        } else {
+            // Nothing playing
+            this._titleLabel.style = 'color: #888888; font-size: 13px;';
+            this._artistLabel.style = 'color: #666666; font-size: 11px;';
+            this._titleLabel.set_text('Nothing Playing');
+            this._artistLabel.set_text('');
+        }
+    }
+
+    _collapse() {
+        this._log('Collapsing');
+
+        // Hide text area and separator
+        this._animateProp(this._textBox, 'opacity', 0);
+        this._animateProp(this._separator, 'opacity', 0);
+
+        if (this._isPlaying) {
+            // Show em dash and widen slightly
+            this._animateProp(this._widget, 'width', COLLAPSED_PLAYING_WIDTH);
+            this._animateProp(this._widget, 'height', COLLAPSED_HEIGHT);
+            this._animateProp(this._waveformLabel, 'opacity', 255);
+        } else {
+            // Nothing playing — shrink to minimal
+            this._animateProp(this._widget, 'width', COLLAPSED_IDLE_WIDTH);
+            this._animateProp(this._widget, 'height', COLLAPSED_HEIGHT);
+            this._animateProp(this._waveformLabel, 'opacity', 0);
+        }
+    }
+
+    // --- DBus ---
 
     _startWatching() {
         this._log('Starting DBus watch');
@@ -166,7 +271,10 @@ export default class FunNotch extends Extension {
             this._watchPlayer(name);
         } else {
             this._log(`Player disappeared: ${name}`);
-            this._clearDisplay();
+            this._isPlaying = false;
+            this._isPaused = false;
+            if (!this._isHovered) this._collapse();
+
             if (this._propertiesWatcherId) {
                 this._dbusConnection.signal_unsubscribe(this._propertiesWatcherId);
                 this._propertiesWatcherId = null;
@@ -176,19 +284,17 @@ export default class FunNotch extends Extension {
 
     _watchPlayer(busName) {
         if (!busName.toLowerCase().includes('firefox')) {
-            this._log(`Skipping non-firefox player: ${busName}`);
+            this._log(`Skipping: ${busName}`);
             return;
         }
 
-        this._log(`Watching Firefox player: ${busName}`);
+        this._log(`Watching: ${busName}`);
         this._currentPlayer = busName;
 
         if (this._propertiesWatcherId) {
             this._dbusConnection.signal_unsubscribe(this._propertiesWatcherId);
         }
 
-        // Listen to ALL property changes — this catches both
-        // Metadata changes (track changed) and PlaybackStatus changes (play/pause)
         this._propertiesWatcherId = this._dbusConnection.signal_subscribe(
             busName,
             'org.freedesktop.DBus.Properties',
@@ -218,7 +324,7 @@ export default class FunNotch extends Extension {
                 try {
                     let reply = connection.call_finish(result);
                     let metadata = reply.deepUnpack()[0];
-                    this._updateLabels(metadata);
+                    this._updateMetadata(metadata);
                 } catch (e) {
                     this._log(`_readCurrentTrack error: ${e}`);
                 }
@@ -251,12 +357,24 @@ export default class FunNotch extends Extension {
     }
 
     _handlePlaybackStatus(status) {
-        // status is one of: "Playing", "Paused", "Stopped"
-        if (status === 'Paused' || status === 'Stopped') {
-            this._clearDisplay();
+        if (status === 'Playing') {
+            this._isPlaying = true;
+            this._isPaused = false;
+        } else if (status === 'Paused') {
+            this._isPlaying = false;
+            this._isPaused = true;
+        } else {
+            // Stopped
+            this._isPlaying = false;
+            this._isPaused = false;
         }
-        // If Playing, the metadata will already be shown via _updateLabels
-        // so we don't need to do anything extra here
+
+        // Update display based on current hover state
+        if (this._isHovered) {
+            this._expand();
+        } else {
+            this._collapse();
+        }
     }
 
     _onPropertiesChanged(connection, sender, objectPath, interfaceName, signalName, parameters) {
@@ -269,11 +387,11 @@ export default class FunNotch extends Extension {
         }
 
         if ('Metadata' in changedProps) {
-            this._updateLabels(changedProps['Metadata']);
+            this._updateMetadata(changedProps['Metadata']);
         }
     }
 
-    _updateLabels(metadata) {
+    _updateMetadata(metadata) {
         try {
             let unpacked = metadata.recursiveUnpack
                 ? metadata.recursiveUnpack()
@@ -284,27 +402,23 @@ export default class FunNotch extends Extension {
 
             if (!trackUrl.includes('music.apple.com')) {
                 this._log('Not Apple Music, ignoring');
-                this._clearDisplay();
                 return;
             }
 
-            let title = unpacked['xesam:title'] ?? '';
+            this._lastTitle = unpacked['xesam:title'] ?? '';
             let artists = unpacked['xesam:artist'] ?? [];
-            let artist = Array.isArray(artists) ? artists.join(', ') : String(artists);
+            this._lastArtist = Array.isArray(artists)
+                ? artists.join(', ')
+                : String(artists);
 
-            this._log(`Now playing: ${artist} — ${title}`);
+            this._log(`Metadata updated: ${this._lastArtist} — ${this._lastTitle}`);
 
-            this._titleLabel.set_text(title || 'Unknown Title');
-            this._artistLabel.set_text(artist || '');
+            // If expanded, update labels immediately
+            if (this._isHovered) this._expand();
 
         } catch (e) {
-            this._log(`_updateLabels error: ${e}`);
+            this._log(`_updateMetadata error: ${e}`);
         }
-    }
-
-    _clearDisplay() {
-        this._titleLabel.set_text('Nothing Playing');
-        this._artistLabel.set_text('');
     }
 
     disable() {

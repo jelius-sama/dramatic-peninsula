@@ -1,0 +1,8 @@
+{
+  "name": "Fun Notch",
+  "description": "iPhone's Dynamic Island on Asahi Linux",
+  "uuid": "fun-notch@jelius.dev",
+  "shell-version": [
+    "49"
+  ]
+}

@@ -24,37 +24,30 @@ import GdkPixbuf from 'gi://GdkPixbuf';
 import Cogl from 'gi://Cogl';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-const MPRIS_BUS_PREFIX = 'org.mpris.MediaPlayer2';
-const MPRIS_OBJECT_PATH = '/org/mpris/MediaPlayer2';
-const MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player';
-const LOG_FILE = '/tmp/fun-notch.log';
-
-// ─── Sizes ─────────────────────────────────────────────────────────────────────
-const COLLAPSED_IDLE_WIDTH = 160;
-const COLLAPSED_PLAYING_WIDTH = 310;
-const EXPANDED_WIDTH = 520;
-const COLLAPSED_HEIGHT = 42;
-const EXPANDED_HEIGHT = 162;
-
-// ─── Animation ────────────────────────────────────────────────────────────────
-const ANIM_DURATION = 280;
-const ANIM_MODE = Clutter.AnimationMode.EASE_OUT_QUINT;
-
-// ─── Waveform ─────────────────────────────────────────────────────────────────
-const WAVE_TICK_MS = 40;
-const WAVE_PERIOD = 750;
-const WAVE_COUNT = 3;
-const WAVE_BAR_W = 3;
-const WAVE_MIN_H = [3, 4, 3];
-const WAVE_MAX_H = [12, 18, 14];
-const WAVE_PHASES = [0, 140, 260];
-const WAVE_REST_H = [6, 11, 7];
-
-// ─── Timeline poll interval ────────────────────────────────────────────────────
-const TIMELINE_TICK_MS = 1000;
+import {
+    COLLAPSED_IDLE_WIDTH,
+    COLLAPSED_PLAYING_WIDTH,
+    EXPANDED_WIDTH,
+    COLLAPSED_HEIGHT,
+    EXPANDED_HEIGHT,
+    ANIM_DURATION,
+    ANIM_MODE,
+    WAVE_TICK_MS,
+    WAVE_PERIOD,
+    WAVE_COUNT,
+    WAVE_BAR_W,
+    WAVE_MIN_H,
+    WAVE_MAX_H,
+    WAVE_PHASES,
+    WAVE_REST_H,
+    TIMELINE_TICK_MS,
+    MPRIS_BUS_PREFIX,
+    MPRIS_OBJECT_PATH,
+    MPRIS_PLAYER_IFACE,
+    LOG_FILE,
+} from './src/constants.js'
 
 export default class FunNotch extends Extension {
-
     // ── Logging ───────────────────────────────────────────────────────────────
 
     _log(msg) {
@@ -88,7 +81,7 @@ export default class FunNotch extends Extension {
         this._timelineTimer = null;
 
         // Volume state
-        this._currentVolume = 0.6;      // 0.0 – 1.0
+        this._currentVolume = 1.0;      // 0.0 – 1.0
 
         this._buildUI();
         this._startWatching();
@@ -171,15 +164,27 @@ export default class FunNotch extends Extension {
         });
 
         // ── Column 1: Album art ───────────────────────────────────────────
-        this._artBox = new St.Widget({
-            layout_manager: new Clutter.BinLayout(),
+        // this._artBox = new St.Widget({
+        //     layout_manager: new Clutter.BinLayout(),
+        //     style: `
+        //         width: 90px;
+        //         min-height: 90px;
+        //         border-radius: 10px;
+        //         background-color: #150e2a;
+        //         border: 1px solid rgba(255,255,255,0.07);
+        //     `,
+        //     y_align: Clutter.ActorAlign.CENTER,
+        //     x_align: Clutter.ActorAlign.CENTER,
+        //     clip_to_allocation: true,
+        // });
+        this._artBox = new St.Bin({
             style: `
-                width: 90px;
-                min-height: 90px;
-                border-radius: 10px;
-                background-color: #150e2a;
-                border: 1px solid rgba(255,255,255,0.07);
-            `,
+        width: 90px;
+        min-height: 90px;
+        border-radius: 10px;
+        background-color: #150e2a;
+        border: 1px solid rgba(255,255,255,0.07);
+    `,
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.CENTER,
             clip_to_allocation: true,
@@ -661,7 +666,6 @@ export default class FunNotch extends Extension {
             let path = file.get_path();
 
             if (!path) {
-                // Remote URL — not typical for Apple Music via MPRIS but handle gracefully
                 this._showArtPlaceholder();
                 return;
             }
@@ -669,8 +673,11 @@ export default class FunNotch extends Extension {
             let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 90, 90, false);
             if (!pixbuf) { this._showArtPlaceholder(); return; }
 
-            let image = new Clutter.Image();
+            let coglContext = global.stage.context.get_backend().get_cogl_context();
+
+            let image = St.ImageContent.new_with_preferred_size(90, 90);
             image.set_bytes(
+                coglContext,                          // ← new first arg in GNOME 48
                 pixbuf.get_pixels(),
                 pixbuf.get_has_alpha()
                     ? Cogl.PixelFormat.RGBA_8888
@@ -932,11 +939,14 @@ export default class FunNotch extends Extension {
     _onPropertiesChanged(conn, sender, path, iface, sig, params) {
         let [, changed] = params.deepUnpack();
 
-        if ('PlaybackStatus' in changed)
-            this._handlePlaybackStatus(changed['PlaybackStatus'].unpack());
-
         if ('Metadata' in changed)
             this._updateMetadata(changed['Metadata']);
+
+        if ('PlaybackStatus' in changed)
+            this._handlePlaybackStatus(
+                changed['PlaybackStatus'].unpack(),
+                changed['Metadata'] ?? null
+            );
 
         if ('Volume' in changed) {
             this._currentVolume = Math.max(0, Math.min(1, changed['Volume'].unpack()));
@@ -953,8 +963,26 @@ export default class FunNotch extends Extension {
         }
     }
 
-    _handlePlaybackStatus(status) {
+    _handlePlaybackStatus(status, metadata = null) {
         this._log(`Status: ${status}`);
+
+        if (metadata !== null) {
+            // Metadata came with this signal — check URL directly
+            try {
+                let u = metadata.recursiveUnpack ? metadata.recursiveUnpack() : metadata;
+                let url = u['xesam:url'] ?? '';
+                if (!url.includes('music.apple.com')) {
+                    this._log('Status ignored: not Apple Music');
+                    return;
+                }
+            } catch (e) {
+                this._log(`_handlePlaybackStatus metadata check: ${e}`);
+                return;
+            }
+        }
+        // metadata is null = status-only signal (pause/resume with no track change)
+        // trust it — it's coming from the same player we already verified
+
         this._isPlaying = (status === 'Playing');
         this._isPaused = (status === 'Paused');
 

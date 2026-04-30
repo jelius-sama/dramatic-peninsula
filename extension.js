@@ -34,7 +34,7 @@ const COLLAPSED_IDLE_WIDTH = 160;
 const COLLAPSED_PLAYING_WIDTH = 310;
 const EXPANDED_WIDTH = 520;
 const COLLAPSED_HEIGHT = 36;
-const EXPANDED_HEIGHT = 120;
+const EXPANDED_HEIGHT = 162;
 
 // ─── Animation ────────────────────────────────────────────────────────────────
 const ANIM_DURATION = 280;
@@ -166,7 +166,8 @@ export default class FunNotch extends Extension {
             x_align: Clutter.ActorAlign.FILL,
             y_align: Clutter.ActorAlign.CENTER,
             opacity: 0,
-            style: 'spacing: 14px; padding: 14px 16px;',
+            // style: 'spacing: 14px; padding: 14px 16px;',
+            style: 'spacing: 14px; padding: 42px 16px 14px 16px;',
         });
 
         // ── Column 1: Album art ───────────────────────────────────────────

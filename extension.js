@@ -20,21 +20,21 @@ import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import GdkPixbuf from 'gi://GdkPixbuf';
+import Cogl from 'gi://Cogl';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 const MPRIS_BUS_PREFIX = 'org.mpris.MediaPlayer2';
 const MPRIS_OBJECT_PATH = '/org/mpris/MediaPlayer2';
+const MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player';
 const LOG_FILE = '/tmp/fun-notch.log';
 
 // ─── Sizes ─────────────────────────────────────────────────────────────────────
-// Collapsed must stay ≤ 36 px — under the 42 px panel height so the pill
-// sits flush inside the panel bar.  Expanded hangs below the panel.
-
 const COLLAPSED_IDLE_WIDTH = 160;
 const COLLAPSED_PLAYING_WIDTH = 310;
 const EXPANDED_WIDTH = 520;
-const COLLAPSED_HEIGHT = 36;   // ≤ 42 px
-const EXPANDED_HEIGHT = 120;   // 90 px art + 15 px padding each side
+const COLLAPSED_HEIGHT = 36;
+const EXPANDED_HEIGHT = 120;
 
 // ─── Animation ────────────────────────────────────────────────────────────────
 const ANIM_DURATION = 280;
@@ -49,6 +49,9 @@ const WAVE_MIN_H = [3, 4, 3];
 const WAVE_MAX_H = [12, 18, 14];
 const WAVE_PHASES = [0, 140, 260];
 const WAVE_REST_H = [6, 11, 7];
+
+// ─── Timeline poll interval ────────────────────────────────────────────────────
+const TIMELINE_TICK_MS = 1000;
 
 export default class FunNotch extends Extension {
 
@@ -74,8 +77,18 @@ export default class FunNotch extends Extension {
         this._isHovered = false;
         this._lastTitle = '';
         this._lastArtist = '';
+        this._lastArtUrl = '';
         this._waveTimer = null;
         this._waveStart = Date.now();
+
+        // Timeline state
+        this._timelineSupported = null; // null = unknown, true/false once probed
+        this._trackLength = 0;          // microseconds
+        this._trackPosition = 0;        // microseconds
+        this._timelineTimer = null;
+
+        // Volume state
+        this._currentVolume = 0.6;      // 0.0 – 1.0
 
         this._buildUI();
         this._startWatching();
@@ -84,24 +97,11 @@ export default class FunNotch extends Extension {
 
     // ─────────────────────────────────────────────────────────────────────────
     // UI Construction
-    //
-    // Architecture:
-    //   _widget  (St.Widget, BinLayout — the outer pill)
-    //     └─ _collapsedLayer  (St.BoxLayout — idle dot OR waveform+title)
-    //     └─ _expandedLayer   (St.BoxLayout — art | center-col | controls-col)
-    //
-    // Only one layer is visible at a time.  Using separate layers means
-    // neither layer's children ever take up invisible space and push things
-    // sideways — the classic cause of the "right-lean" bug with a single
-    // shared BoxLayout.
     // ─────────────────────────────────────────────────────────────────────────
 
     _buildUI() {
 
         // ── Outer pill container ──────────────────────────────────────────
-        // BinLayout stacks children on top of each other, so collapsed and
-        // expanded layers share the same space.  The pill shape (flat top,
-        // rounded bottom) is set on this actor.
         this._widget = new St.Widget({
             layout_manager: new Clutter.BinLayout(),
             style: this._pillStyle(COLLAPSED_IDLE_WIDTH, COLLAPSED_HEIGHT),
@@ -110,8 +110,6 @@ export default class FunNotch extends Extension {
         });
 
         // ── Collapsed layer ───────────────────────────────────────────────
-        // A simple horizontal BoxLayout that fills the pill.
-        // Children: idleDot (idle) -OR- waveBox + collapsedTitle (playing).
         this._collapsedLayer = new St.BoxLayout({
             x_expand: true,
             y_expand: true,
@@ -120,7 +118,6 @@ export default class FunNotch extends Extension {
             style: 'spacing: 10px; padding: 0 14px;',
         });
 
-        // Idle dot — centered single dot when nothing plays
         this._idleDot = new St.Widget({
             style: `
                 width: 7px;
@@ -133,7 +130,6 @@ export default class FunNotch extends Extension {
             x_expand: true,
         });
 
-        // Waveform bars
         this._waveBox = new St.BoxLayout({
             style: 'spacing: 2px;',
             y_align: Clutter.ActorAlign.CENTER,
@@ -149,7 +145,6 @@ export default class FunNotch extends Extension {
             this._waveBars.push(bar);
         }
 
-        // Collapsed track title (truncated single line)
         this._collapsedTitle = new St.Label({
             text: '',
             style: 'color: rgba(255,255,255,0.68); font-size: 12px;',
@@ -161,13 +156,10 @@ export default class FunNotch extends Extension {
             imports.gi.Pango.EllipsizeMode.END
         );
 
-        // Start collapsed layer with just the idle dot
         this._collapsedLayer.add_child(this._idleDot);
         this._widget.add_child(this._collapsedLayer);
 
         // ── Expanded layer ────────────────────────────────────────────────
-        // Three-column horizontal layout: [art] [center] [controls]
-        // Hidden (opacity 0, width/height 0) until hover.
         this._expandedLayer = new St.BoxLayout({
             x_expand: true,
             y_expand: true,
@@ -178,7 +170,8 @@ export default class FunNotch extends Extension {
         });
 
         // ── Column 1: Album art ───────────────────────────────────────────
-        this._artBox = new St.BoxLayout({
+        this._artBox = new St.Widget({
+            layout_manager: new Clutter.BinLayout(),
             style: `
                 width: 90px;
                 min-height: 90px;
@@ -188,15 +181,27 @@ export default class FunNotch extends Extension {
             `,
             y_align: Clutter.ActorAlign.CENTER,
             x_align: Clutter.ActorAlign.CENTER,
+            clip_to_allocation: true,
         });
+
+        // Placeholder label (shown when no art)
         this._artLabel = new St.Label({
             text: '♪',
             style: 'color: rgba(255,255,255,0.20); font-size: 28px;',
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
             x_expand: true,
+            y_expand: true,
         });
         this._artBox.add_child(this._artLabel);
+
+        // Texture actor for real album art (hidden until loaded)
+        this._artTexture = new Clutter.Actor({
+            x_expand: true,
+            y_expand: true,
+            opacity: 0,
+        });
+        this._artBox.add_child(this._artTexture);
 
         // ── Column 2: Track info + progress bar ───────────────────────────
         this._centerCol = new St.BoxLayout({
@@ -228,29 +233,48 @@ export default class FunNotch extends Extension {
             imports.gi.Pango.EllipsizeMode.END
         );
 
-        // Spacer pushes progress to bottom of column
         this._centerSpacer = new St.Widget({ y_expand: true });
 
-        // Progress track + fill (child widget for the fill bar)
+        // Progress row — hidden via opacity if timeline not supported
+        this._progressRow = new St.BoxLayout({
+            vertical: true,
+            x_expand: true,
+            style: 'spacing: 2px;',
+        });
+
         this._progressTrack = new St.Widget({
             style: `
-                height: 3px;
-                border-radius: 2px;
+                height: 8px;
+                border-radius: 4px;
                 background-color: rgba(255,255,255,0.10);
             `,
             x_expand: true,
+            reactive: true,
         });
         this._progressFill = new St.Widget({
             style: `
-                width: 130px;
-                height: 3px;
-                border-radius: 2px;
+                width: 0px;
+                height: 8px;
+                border-radius: 4px;
                 background-color: rgba(255,255,255,0.50);
             `,
         });
         this._progressTrack.add_child(this._progressFill);
 
-        // Timestamps row
+        // Click on progress track to seek
+        this._progressTrack.connect('button-press-event', (actor, event) => {
+            if (!this._timelineSupported || this._trackLength <= 0) return Clutter.EVENT_PROPAGATE;
+            let [x] = event.get_coords();
+            let [ax] = actor.get_transformed_position();
+            let w = actor.get_width();
+            let frac = Math.max(0, Math.min(1, (x - ax) / w));
+            let seekPos = Math.round(frac * this._trackLength);
+            this._mprisCall('SetPosition', new GLib.Variant('(ox)', ['/org/mpris/MediaPlayer2/TrackList/NoTrack', seekPos]));
+            this._trackPosition = seekPos;
+            this._updateProgressUI();
+            return Clutter.EVENT_STOP;
+        });
+
         this._timeRow = new St.BoxLayout({ x_expand: true });
         this._timeElapsed = new St.Label({
             text: '0:00',
@@ -267,15 +291,15 @@ export default class FunNotch extends Extension {
         this._timeRow.add_child(this._timeSpacer);
         this._timeRow.add_child(this._timeTotal);
 
+        this._progressRow.add_child(this._progressTrack);
+        this._progressRow.add_child(this._timeRow);
+
         this._centerCol.add_child(this._expandedTitle);
         this._centerCol.add_child(this._expandedArtist);
         this._centerCol.add_child(this._centerSpacer);
-        this._centerCol.add_child(this._progressTrack);
-        this._centerCol.add_child(this._timeRow);
+        this._centerCol.add_child(this._progressRow);
 
         // ── Column 3: Playback controls ───────────────────────────────────
-        // Vertical: [⏮ ⏸ ⏭] above [volume strip]
-        // Buttons use very dark subtle backgrounds — no bright grey circles.
         this._controlsCol = new St.BoxLayout({
             vertical: true,
             x_align: Clutter.ActorAlign.CENTER,
@@ -293,11 +317,25 @@ export default class FunNotch extends Extension {
         this._btnPlayPause = this._makeCtrlBtn('play');
         this._btnNext = this._makeCtrlBtn('next');
 
+        // ── Wire button click handlers ─────────────────────────────────────
+        this._btnPrev.connect('clicked', () => {
+            this._log('Prev clicked');
+            this._mprisCall('Previous', null);
+        });
+        this._btnPlayPause.connect('clicked', () => {
+            this._log('PlayPause clicked');
+            this._mprisCall('PlayPause', null);
+        });
+        this._btnNext.connect('clicked', () => {
+            this._log('Next clicked');
+            this._mprisCall('Next', null);
+        });
+
         this._btnRow.add_child(this._btnPrev);
         this._btnRow.add_child(this._btnPlayPause);
         this._btnRow.add_child(this._btnNext);
 
-        // Volume row
+        // ── Volume row ────────────────────────────────────────────────────
         this._volRow = new St.BoxLayout({
             style: 'spacing: 5px;',
             x_align: Clutter.ActorAlign.CENTER,
@@ -311,17 +349,18 @@ export default class FunNotch extends Extension {
         this._volTrack = new St.Widget({
             style: `
                 width: 58px;
-                height: 2px;
-                border-radius: 1px;
+                height: 8px;
+                border-radius: 4px;
                 background-color: rgba(255,255,255,0.10);
             `,
             y_align: Clutter.ActorAlign.CENTER,
+            reactive: true,
         });
         this._volFill = new St.Widget({
             style: `
                 width: 36px;
-                height: 2px;
-                border-radius: 1px;
+                height: 8px;
+                border-radius: 4px;
                 background-color: rgba(255,255,255,0.35);
             `,
         });
@@ -331,6 +370,18 @@ export default class FunNotch extends Extension {
             style: 'font-size: 9px; color: rgba(255,255,255,0.22);',
             y_align: Clutter.ActorAlign.CENTER,
         });
+
+        // Click on volume track to set volume
+        this._volTrack.connect('button-press-event', (actor, event) => {
+            this._onVolTrackClick(actor, event);
+            return Clutter.EVENT_STOP;
+        });
+        // Scroll on volume track to nudge volume
+        this._volTrack.connect('scroll-event', (actor, event) => {
+            this._onVolScroll(event);
+            return Clutter.EVENT_STOP;
+        });
+
         this._volRow.add_child(this._volLow);
         this._volRow.add_child(this._volTrack);
         this._volRow.add_child(this._volHigh);
@@ -351,8 +402,6 @@ export default class FunNotch extends Extension {
             align_axis: Clutter.AlignAxis.X_AXIS,
             factor: 0.5,
         }));
-        // factor 0.0 = top edge — flat top merges with panel bar,
-        // rounded bottom hangs below like a hardware notch.
         this._widget.add_constraint(new Clutter.AlignConstraint({
             source: Main.layoutManager.uiGroup,
             align_axis: Clutter.AlignAxis.Y_AXIS,
@@ -374,7 +423,6 @@ export default class FunNotch extends Extension {
 
     // ── Style helpers ─────────────────────────────────────────────────────────
 
-    // Flat top / rounded bottom — mimics a notch cutout below the panel bar.
     _pillStyle(w, h) {
         return `
             background-color: #0c0c0c;
@@ -394,74 +442,265 @@ export default class FunNotch extends Extension {
     }
 
     // ── Control button factory ────────────────────────────────────────────────
-    //
-    // Design intent: buttons should read as dark, near-invisible controls on
-    // the black background — like the boringNotch style where the icons float
-    // without obvious button chrome.  The play button gets a very subtle dark
-    // tint to distinguish it, not a bright grey circle.
-    //
-    // No click handlers wired — these are UI stubs only.
 
     _makeCtrlBtn(role) {
         const isPlay = role === 'play';
         const size = isPlay ? 40 : 32;
-
-        // Glyphs — plain Unicode, no emoji, renders cleanly at these sizes
         const glyphs = { prev: '⏮', play: '⏸', next: '⏭' };
 
-        // Colors: play button gets a barely-there tint; side buttons are
-        // fully transparent backgrounds so they don't look like grey pills.
-        const bgNormal = isPlay
-            ? 'rgba(255,255,255,0.08)'   // very faint — almost invisible
-            : 'rgba(255,255,255,0.00)';  // transparent
-        const bgHover = isPlay
-            ? 'rgba(255,255,255,0.16)'
-            : 'rgba(255,255,255,0.08)';
-        const fgNormal = isPlay
-            ? 'rgba(255,255,255,0.90)'
-            : 'rgba(255,255,255,0.55)';
+        const bgNormal = isPlay ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.00)';
+        const bgHover = isPlay ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.08)';
+        const fgNormal = isPlay ? 'rgba(255,255,255,0.90)' : 'rgba(255,255,255,0.55)';
         const fgHover = 'rgba(255,255,255,1.00)';
 
+        const baseStyle = (bg, fg) => `
+            width: ${size}px;
+            height: ${size}px;
+            border-radius: ${Math.round(size / 2)}px;
+            background-color: ${bg};
+            color: ${fg};
+            font-size: ${isPlay ? 17 : 14}px;
+            padding: 0;
+        `;
+
         let btn = new St.Button({
-            style: `
-                width: ${size}px;
-                height: ${size}px;
-                border-radius: ${Math.round(size / 2)}px;
-                background-color: ${bgNormal};
-                color: ${fgNormal};
-                font-size: ${isPlay ? 17 : 14}px;
-                padding: 0;
-            `,
+            style: baseStyle(bgNormal, fgNormal),
             label: glyphs[role],
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
             reactive: true,
         });
 
-        btn.connect('enter-event', () => {
-            btn.style = `
-                width: ${size}px;
-                height: ${size}px;
-                border-radius: ${Math.round(size / 2)}px;
-                background-color: ${bgHover};
-                color: ${fgHover};
-                font-size: ${isPlay ? 17 : 14}px;
-                padding: 0;
-            `;
-        });
-        btn.connect('leave-event', () => {
-            btn.style = `
-                width: ${size}px;
-                height: ${size}px;
-                border-radius: ${Math.round(size / 2)}px;
-                background-color: ${bgNormal};
-                color: ${fgNormal};
-                font-size: ${isPlay ? 17 : 14}px;
-                padding: 0;
-            `;
-        });
+        btn.connect('enter-event', () => { btn.style = baseStyle(bgHover, fgHover); });
+        btn.connect('leave-event', () => { btn.style = baseStyle(bgNormal, fgNormal); });
 
         return btn;
+    }
+
+    // ── MPRIS DBus method call ─────────────────────────────────────────────────
+
+    _mprisCall(method, params) {
+        if (!this._currentPlayer) return;
+        this._dbusConnection.call(
+            this._currentPlayer,
+            MPRIS_OBJECT_PATH,
+            MPRIS_PLAYER_IFACE,
+            method,
+            params,
+            null,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (conn, res) => {
+                try { conn.call_finish(res); }
+                catch (e) { this._log(`_mprisCall ${method}: ${e}`); }
+            }
+        );
+    }
+
+    // ── MPRIS DBus property set ────────────────────────────────────────────────
+
+    _mprisSet(prop, value) {
+        if (!this._currentPlayer) return;
+        this._dbusConnection.call(
+            this._currentPlayer,
+            MPRIS_OBJECT_PATH,
+            'org.freedesktop.DBus.Properties',
+            'Set',
+            new GLib.Variant('(ssv)', [MPRIS_PLAYER_IFACE, prop, value]),
+            null,
+            Gio.DBusCallFlags.NONE,
+            -1,
+            null,
+            (conn, res) => {
+                try { conn.call_finish(res); }
+                catch (e) { this._log(`_mprisSet ${prop}: ${e}`); }
+            }
+        );
+    }
+
+    // ── Volume handling ───────────────────────────────────────────────────────
+
+    _onVolTrackClick(actor, event) {
+        let [x] = event.get_coords();
+        let [ax] = actor.get_transformed_position();
+        let w = actor.get_width();
+        let frac = Math.max(0, Math.min(1, (x - ax) / w));
+        this._setVolume(frac);
+    }
+
+    _onVolScroll(event) {
+        let dir = event.get_scroll_direction();
+        let delta = (dir === Clutter.ScrollDirection.UP) ? 0.05 : -0.05;
+        this._setVolume(Math.max(0, Math.min(1, this._currentVolume + delta)));
+    }
+
+    _setVolume(frac) {
+        this._currentVolume = frac;
+        this._mprisSet('Volume', new GLib.Variant('d', frac));
+        this._updateVolUI();
+    }
+
+    _updateVolUI() {
+        // volFill width is 0–58 px
+        let px = Math.round(this._currentVolume * 58);
+        this._volFill.style = `
+            width: ${px}px;
+            height: 8px;
+            border-radius: 4px;
+            background-color: rgba(255,255,255,0.35);
+        `;
+    }
+
+    _readVolume(busName) {
+        this._dbusGet(busName, 'Volume', reply => {
+            try {
+                let vol = reply.deepUnpack()[0].unpack();
+                this._currentVolume = Math.max(0, Math.min(1, vol));
+                this._updateVolUI();
+            } catch (e) { this._log(`_readVolume: ${e}`); }
+        });
+    }
+
+    // ── Timeline handling ─────────────────────────────────────────────────────
+
+    _probeTimeline(busName) {
+        // Try reading Position; if it throws / returns nothing, mark unsupported
+        this._dbusGet(busName, 'Position', reply => {
+            try {
+                let pos = reply.deepUnpack()[0].unpack(); // microseconds (int64)
+                this._timelineSupported = true;
+                this._trackPosition = pos;
+                this._log(`Timeline supported, pos=${pos}`);
+                this._updateProgressUI();
+                this._startTimelinePoller();
+            } catch (e) {
+                this._log(`Timeline not supported: ${e}`);
+                this._timelineSupported = false;
+                // Hide progress row — keeps layout intact, just invisible
+                this._progressRow.opacity = 0;
+            }
+        });
+    }
+
+    _startTimelinePoller() {
+        if (this._timelineTimer) return;
+        this._timelineTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, TIMELINE_TICK_MS, () => {
+            if (!this._widget || !this._currentPlayer || !this._timelineSupported)
+                return GLib.SOURCE_REMOVE;
+
+            if (this._isPlaying) {
+                // Optimistically advance position without a DBus round-trip every second
+                this._trackPosition = Math.min(
+                    this._trackPosition + TIMELINE_TICK_MS * 1000,
+                    this._trackLength
+                );
+                this._updateProgressUI();
+
+                // Every 5 seconds do a real DBus read to re-sync
+                if (!this._syncCounter) this._syncCounter = 0;
+                this._syncCounter++;
+                if (this._syncCounter % 5 === 0) {
+                    this._dbusGet(this._currentPlayer, 'Position', reply => {
+                        try {
+                            this._trackPosition = reply.deepUnpack()[0].unpack();
+                            this._updateProgressUI();
+                        } catch (_) { }
+                    });
+                }
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopTimelinePoller() {
+        if (this._timelineTimer) {
+            GLib.Source.remove(this._timelineTimer);
+            this._timelineTimer = null;
+        }
+    }
+
+    _updateProgressUI() {
+        if (!this._timelineSupported) return;
+
+        let elapsed = this._trackPosition;  // µs
+        let total = this._trackLength;    // µs
+
+        let frac = total > 0 ? Math.max(0, Math.min(1, elapsed / total)) : 0;
+        let trackPx = this._progressTrack.get_width() || 200;
+        let fillPx = Math.round(frac * trackPx);
+
+        this._progressFill.style = `
+            width: ${fillPx}px;
+            height: 8px;
+            border-radius: 4px;
+            background-color: rgba(255,255,255,0.50);
+        `;
+
+        this._timeElapsed.set_text(this._formatTime(elapsed));
+        this._timeTotal.set_text(this._formatTime(total));
+    }
+
+    _formatTime(microseconds) {
+        let secs = Math.floor(microseconds / 1_000_000);
+        let m = Math.floor(secs / 60);
+        let s = secs % 60;
+        return `${m}:${s.toString().padStart(2, '0')}`;
+    }
+
+    // ── Album art loading ─────────────────────────────────────────────────────
+
+    _loadAlbumArt(artUrl) {
+        if (!artUrl || artUrl === this._lastArtUrl) return;
+        this._lastArtUrl = artUrl;
+        this._log(`Loading art: ${artUrl}`);
+
+        try {
+            let file = Gio.File.new_for_uri(artUrl);
+            let path = file.get_path();
+
+            if (!path) {
+                // Remote URL — not typical for Apple Music via MPRIS but handle gracefully
+                this._showArtPlaceholder();
+                return;
+            }
+
+            let pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, 90, 90, false);
+            if (!pixbuf) { this._showArtPlaceholder(); return; }
+
+            let image = new Clutter.Image();
+            image.set_bytes(
+                pixbuf.get_pixels(),
+                pixbuf.get_has_alpha()
+                    ? Cogl.PixelFormat.RGBA_8888
+                    : Cogl.PixelFormat.RGB_888,
+                pixbuf.get_width(),
+                pixbuf.get_height(),
+                pixbuf.get_rowstride()
+            );
+
+            this._artTexture.set_content(image);
+            this._artTexture.set_content_scaling_filters(
+                Clutter.ScalingFilter.TRILINEAR,
+                Clutter.ScalingFilter.LINEAR
+            );
+            this._artTexture.set_content_gravity(Clutter.ContentGravity.RESIZE_FILL);
+
+            // Fade in texture, fade out placeholder label
+            this._artLabel.opacity = 0;
+            this._artTexture.opacity = 255;
+
+            this._log('Art loaded successfully');
+        } catch (e) {
+            this._log(`Art load failed: ${e}`);
+            this._showArtPlaceholder();
+        }
+    }
+
+    _showArtPlaceholder() {
+        this._lastArtUrl = '';
+        this._artTexture.opacity = 0;
+        this._artLabel.opacity = 255;
     }
 
     // ── Waveform animation ────────────────────────────────────────────────────
@@ -496,16 +735,13 @@ export default class FunNotch extends Extension {
     _expand() {
         this._log('expand');
 
-        // Resize the pill
         this._widget.style = this._pillStyle(EXPANDED_WIDTH, EXPANDED_HEIGHT);
         this._animateProp(this._widget, 'width', EXPANDED_WIDTH);
         this._animateProp(this._widget, 'height', EXPANDED_HEIGHT);
 
-        // Swap layers
         this._animateProp(this._collapsedLayer, 'opacity', 0);
         this._animateProp(this._expandedLayer, 'opacity', 255);
 
-        // Populate text and update play/pause glyph
         if (this._isPlaying) {
             this._btnPlayPause.label = '⏸';
             this._expandedTitle.style = 'color: white; font-size: 13px; font-weight: bold;';
@@ -524,9 +760,10 @@ export default class FunNotch extends Extension {
         this._expandedTitle.set_text(
             this._lastTitle || (hasTrack ? 'Unknown Title' : 'Nothing Playing')
         );
-        // this._expandedArtist.set_text(this._lastArtist || '');
-        // Don't need the title when not hovered
         this._expandedArtist.set_text('');
+
+        // Refresh progress display when expanding
+        if (this._timelineSupported) this._updateProgressUI();
     }
 
     // ── Collapse (not hovered) ────────────────────────────────────────────────
@@ -534,7 +771,6 @@ export default class FunNotch extends Extension {
     _collapse() {
         this._log('collapse');
 
-        // Fade out expanded layer
         this._animateProp(this._expandedLayer, 'opacity', 0);
 
         if (this._isPlaying || this._isPaused) {
@@ -543,7 +779,6 @@ export default class FunNotch extends Extension {
             this._animateProp(this._widget, 'width', w);
             this._animateProp(this._widget, 'height', COLLAPSED_HEIGHT);
 
-            // Rebuild collapsed layer: waveform + title
             this._syncCollapsedPlaying();
             this._animateProp(this._collapsedLayer, 'opacity',
                 this._isPaused ? 160 : 255
@@ -553,27 +788,21 @@ export default class FunNotch extends Extension {
             this._animateProp(this._widget, 'width', COLLAPSED_IDLE_WIDTH);
             this._animateProp(this._widget, 'height', COLLAPSED_HEIGHT);
 
-            // Rebuild collapsed layer: just the idle dot
             this._syncCollapsedIdle();
             this._animateProp(this._collapsedLayer, 'opacity', 255);
         }
     }
 
-    // Swap collapsed layer children to the "idle" layout (single dot, centered)
     _syncCollapsedIdle() {
         this._collapsedLayer.remove_all_children();
         this._collapsedLayer.style = 'spacing: 0px; padding: 0 14px;';
-
-        // Re-add just the dot; x_expand centers it in the row
         this._idleDot.x_expand = true;
         this._collapsedLayer.add_child(this._idleDot);
     }
 
-    // Swap collapsed layer children to the "playing" layout (waveform + title)
     _syncCollapsedPlaying() {
         this._collapsedLayer.remove_all_children();
         this._collapsedLayer.style = 'spacing: 8px; padding: 0 14px;';
-
         this._idleDot.x_expand = false;
         this._collapsedLayer.add_child(this._waveBox);
         this._collapsedLayer.add_child(this._collapsedTitle);
@@ -633,6 +862,8 @@ export default class FunNotch extends Extension {
             this._log(`Player left: ${name}`);
             this._isPlaying = false;
             this._isPaused = false;
+            this._stopTimelinePoller();
+            this._showArtPlaceholder();
             if (!this._isHovered) this._collapse();
 
             if (this._propertiesWatcherId) {
@@ -663,13 +894,15 @@ export default class FunNotch extends Extension {
 
         this._readCurrentTrack(busName);
         this._readPlaybackStatus(busName);
+        this._readVolume(busName);
+        this._probeTimeline(busName);
     }
 
     _dbusGet(busName, prop, cb) {
         this._dbusConnection.call(
             busName, MPRIS_OBJECT_PATH,
             'org.freedesktop.DBus.Properties', 'Get',
-            new GLib.Variant('(ss)', ['org.mpris.MediaPlayer2.Player', prop]),
+            new GLib.Variant('(ss)', [MPRIS_PLAYER_IFACE, prop]),
             new GLib.VariantType('(v)'),
             Gio.DBusCallFlags.NONE, -1, null,
             (conn, res) => {
@@ -701,6 +934,20 @@ export default class FunNotch extends Extension {
 
         if ('Metadata' in changed)
             this._updateMetadata(changed['Metadata']);
+
+        if ('Volume' in changed) {
+            this._currentVolume = Math.max(0, Math.min(1, changed['Volume'].unpack()));
+            this._updateVolUI();
+        }
+
+        // Seek event also fires PropertiesChanged with no Position key, but
+        // the Seeked signal is separate — handle Position if present (rare)
+        if ('Position' in changed && this._timelineSupported) {
+            try {
+                this._trackPosition = changed['Position'].unpack();
+                this._updateProgressUI();
+            } catch (_) { }
+        }
     }
 
     _handlePlaybackStatus(status) {
@@ -725,7 +972,17 @@ export default class FunNotch extends Extension {
             this._lastTitle = u['xesam:title'] ?? '';
             let artists = u['xesam:artist'] ?? [];
             this._lastArtist = Array.isArray(artists) ? artists.join(', ') : String(artists);
-            this._log(`Meta: ${this._lastArtist} — ${this._lastTitle}`);
+
+            // Track length from metadata (µs)
+            let len = u['mpris:length'];
+            this._trackLength = (len !== undefined && len !== null) ? Number(len) : 0;
+
+            // Album art URL
+            let artUrl = u['mpris:artUrl'] ?? '';
+            if (artUrl) this._loadAlbumArt(artUrl);
+            else this._showArtPlaceholder();
+
+            this._log(`Meta: ${this._lastArtist} — ${this._lastTitle} (len=${this._trackLength})`);
 
             if (this._isHovered) this._expand();
             else this._collapse();
@@ -743,6 +1000,8 @@ export default class FunNotch extends Extension {
             GLib.Source.remove(this._waveTimer);
             this._waveTimer = null;
         }
+
+        this._stopTimelinePoller();
 
         if (this._nameWatcherId) {
             this._dbusConnection.signal_unsubscribe(this._nameWatcherId);

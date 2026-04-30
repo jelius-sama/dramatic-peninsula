@@ -47,7 +47,9 @@ export default class FunNotch extends Extension {
             let stream = file.append_to(Gio.FileCreateFlags.NONE, null);
             stream.write(line, null);
             stream.close(null);
-        } catch (e) { }
+        } catch (e) {
+            console.error(e)
+        }
     }
 
     enable() {

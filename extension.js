@@ -33,7 +33,7 @@ const LOG_FILE = '/tmp/fun-notch.log';
 const COLLAPSED_IDLE_WIDTH = 160;
 const COLLAPSED_PLAYING_WIDTH = 310;
 const EXPANDED_WIDTH = 520;
-const COLLAPSED_HEIGHT = 36;
+const COLLAPSED_HEIGHT = 42;
 const EXPANDED_HEIGHT = 162;
 
 // ─── Animation ────────────────────────────────────────────────────────────────
@@ -807,7 +807,9 @@ export default class FunNotch extends Extension {
         this._idleDot.x_expand = false;
         this._collapsedLayer.add_child(this._waveBox);
         this._collapsedLayer.add_child(this._collapsedTitle);
-        this._collapsedTitle.set_text(this._lastTitle || '');
+        // this._collapsedTitle.set_text(this._lastTitle || '');
+        // We don't need to show title
+        this._collapsedTitle.set_text('');
     }
 
     // ── Generic animate helper ────────────────────────────────────────────────

@@ -774,7 +774,7 @@ export default class FunNotch extends Extension {
 
         this._animateProp(this._expandedLayer, 'opacity', 0);
 
-        if (this._isPlaying || this._isPaused) {
+        if (this._isPlaying) {
             let w = COLLAPSED_PLAYING_WIDTH;
             this._widget.style = this._pillStyle(w, COLLAPSED_HEIGHT);
             this._animateProp(this._widget, 'width', w);

@@ -102,8 +102,9 @@ export default class FunNotch extends Extension {
         // ── Outer pill ────────────────────────────────────────────────────
         this._widget = new St.Widget({
             layout_manager: new Clutter.BinLayout(),
+            // background-color: #0c0c0c;
             style: `
-                background-color: #0c0c0c;
+                background-color: #000000;
                 border-radius: 0 0 22px 22px;
                 width: ${COLLAPSED_IDLE_WIDTH}px;
                 height: ${COLLAPSED_HEIGHT}px;

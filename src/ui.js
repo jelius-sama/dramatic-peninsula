@@ -243,8 +243,9 @@ export class NotchUI {
     }
 
     _pillStyle(w, h) {
+        // background-color: #0c0c0c;
         return `
-            background-color: #0c0c0c;
+            background-color: #000000;
             border-radius: 0 0 22px 22px;
             width: ${w}px;
             height: ${h}px;
